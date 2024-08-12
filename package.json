@@ -1,0 +1,15 @@
+{
+  "name": "8arss",
+  "module": "index.ts",
+  "type": "module",
+  "devDependencies": {
+    "@types/bun": "latest"
+  },
+  "peerDependencies": {
+    "typescript": "^5.0.0"
+  },
+  "dependencies": {
+    "@numbered/feed": "^4.2.8",
+    "linkedom": "^0.18.4"
+  }
+}
