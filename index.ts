@@ -13,19 +13,6 @@
 import { DOMParser, parseHTML } from 'linkedom';
 import { Feed } from "@numbered/feed";
 
-const response = await fetch('https://www.8a.nu')
-const html = await response.text()
-
-const { document } = parseHTML(html)
-
-const newsList = document.querySelector('.news-list')
-
-if (!newsList) {
-    throw new Error('Could not find .news-list')
-}
-
-const items = newsList.querySelectorAll('.news-item')
-
 const feed = new Feed({
     title: '8a.nu news',
     description: '8a.nu news',
@@ -49,28 +36,50 @@ const feed = new Feed({
     },
 })
 
-items.forEach((item) => {
-    const image = item.querySelector('.news-image') as HTMLImageElement
-    const header = item.querySelector('.news-item-header')
-    const content = item.querySelector('.news-content')
-    const link = item.querySelector('a')
+const response = await fetch('https://www.8a.nu')
+const html = await response.text()
 
-    console.log(
-        `image: ${image ? 'ok' : 'missing'}, header: ${header ? 'ok' : 'missing'
-        }, content: ${content ? 'ok' : 'missing'}, link: ${link ? 'ok' : 'missing'
-        }`)
-    if (!image || !header || !content || !link) {
-        return
-    }
+const { document } = parseHTML(html)
 
-    feed.addItem({
-        title: header.textContent || 'No title',
-        id: link.href,
-        link: link.href,
-        description: content.textContent || 'No content',
-        content: item.outerHTML,
-        image: image.src,
-        date: new Date(), // TODO: extract date from the item
+const newsLists = document.querySelectorAll('.news-list')
+
+// match /\[\{fileName:"[^"]+"\}\]/g, and find all occurences. Hope the list is the same as the images we have in the news-list
+
+const imageSrcs = html.match(/\[\{fileName:"([^"])+"\}\]/g)?.map((match) => match.slice(12, -3).replaceAll("\\u002F", "/"))
+
+
+newsLists.forEach((newsList) => {
+    const items = newsList.querySelectorAll('.news-item')
+
+    items.forEach((item) => {
+        const image = item.querySelector('.news-image') as HTMLImageElement
+        const header = item.querySelector('.news-item-header')
+        const content = item.querySelector('.news-content')
+        const link = item.querySelector('a')
+
+        if (!link) {
+            console.log(`
+image: ${image ? 'ok' : 'missing'},
+header: ${header ? 'ok' : 'missing'},
+content: ${content ? 'ok' : 'missing'},
+link: ${link ? 'ok' : 'missing'}`)
+            return
+        }
+
+        let imageSrc = image?.src;
+        if (image && !image.src) {
+            image.src = "https://d3byf4kaqtov0k.cloudfront.net/" + imageSrcs?.shift() || '';
+        }
+
+        feed.addItem({
+            title: header?.textContent || 'No title',
+            id: link.href,
+            link: link.href,
+            description: content?.textContent || 'No content',
+            content: item.outerHTML,
+            image: imageSrc,
+            date: new Date(), // TODO: extract date from the item
+        })
     })
 })
 
