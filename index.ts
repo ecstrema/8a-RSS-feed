@@ -71,12 +71,14 @@ link: ${link ? 'ok' : 'missing'}`)
             image.src = "https://d3byf4kaqtov0k.cloudfront.net/" + imageSrcs?.shift() || '';
         }
 
+        const title = header?.textContent || 'No title'
+
         feed.addItem({
-            title: header?.textContent || 'No title',
+            title,
             id: link.href,
             link: link.href,
             description: content?.textContent || 'No content',
-            content: item.outerHTML,
+            content: `<img src="${image.src}" alt="${title}" />` + content?.outerHTML,
             image: imageSrc,
             date: new Date(), // TODO: extract date from the item
         })
