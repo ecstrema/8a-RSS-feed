@@ -68,7 +68,7 @@ items.forEach((item) => {
         id: link.href,
         link: link.href,
         description: content.textContent || 'No content',
-        content: content.outerHTML || 'No content',
+        content: item.outerHTML,
         image: image.src,
         date: new Date(), // TODO: extract date from the item
     })
