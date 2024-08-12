@@ -43,16 +43,11 @@ const { document } = parseHTML(html)
 
 const newsLists = document.querySelectorAll('.news-list')
 
-// match /\[\{fileName:"[^"]+"\}\]/g, and find all occurences. Hope the list is the same as the images we have in the news-list
-
-const imageSrcs = html.match(/\[\{fileName:"([^"])+"\}\]/g)?.map((match) => match.slice(12, -3).replaceAll("\\u002F", "/"))
-
-
 newsLists.forEach((newsList) => {
     const items = newsList.querySelectorAll('.news-item')
 
     items.forEach((item) => {
-        const image = item.querySelector('.news-image') as HTMLImageElement
+        const image = item.querySelector('.news-image') as HTMLImageElement | null
         const header = item.querySelector('.news-item-header')
         const content = item.querySelector('.news-content')
         const link = item.querySelector('a')
@@ -66,20 +61,18 @@ link: ${link ? 'ok' : 'missing'}`)
             return
         }
 
-        let imageSrc = image?.src;
-        if (image && !image.src) {
-            image.src = "https://d3byf4kaqtov0k.cloudfront.net/" + imageSrcs?.shift() || '';
+        if (image) {
+            image.alt = header?.textContent || ""
         }
 
-        const title = header?.textContent || 'No title'
 
         feed.addItem({
-            title,
+            title: header?.textContent || 'No title',
             id: link.href,
             link: link.href,
             description: content?.textContent || 'No content',
-            content: `<img src="${image.src}" alt="${title}" />` + content?.outerHTML,
-            image: imageSrc,
+            content: image?.src ? image.outerHTML + content?.outerHTML : content?.outerHTML,
+            image: image?.src,
             date: new Date(), // TODO: extract date from the item
         })
     })
