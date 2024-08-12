@@ -8,6 +8,6 @@ This repo generates an RSS feed for 8a.nu's news section. The feed is updated ev
 
 Copy these links into your favorite reader:
 
- - RSS: `https://ecstrema.github.io/8a.nu-rss/rss.xml`
- - Atom: `https://ecstrema.github.io/8a.nu-rss/atom.xml`
- - JSON: `https://ecstrema.github.io/8a.nu-rss/feed.json`
+ - RSS: https://ecstrema.github.io/8a-RSS-feed/rss.xml
+ - Atom: https://ecstrema.github.io/8a-RSS-feed/atom.xml
+ - JSON: https://ecstrema.github.io/8a-RSS-feed/feed.json
