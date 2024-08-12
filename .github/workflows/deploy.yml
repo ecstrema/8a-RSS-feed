@@ -18,7 +18,7 @@ jobs:
         with:
           path: dist
 
-deploy:
+  deploy:
     needs: build
 
     permissions:
