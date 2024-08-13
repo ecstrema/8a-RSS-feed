@@ -43,40 +43,44 @@ const { document } = parseHTML(html)
 
 const newsLists = document.querySelectorAll('.news-list')
 
+async function extractFromItem(item: Element) {
+    const link = item.querySelector('a')
+
+    if (!link) {
+        console.log("link not found")
+        return
+    }
+
+    const fullLink = "https://www.8a.nu" + link.href
+
+    const response = await fetch(fullLink)
+    const html = await response.text()
+    const { document } = parseHTML(html)
+
+    const newsItem = document.querySelector('.news-item')
+    const image = newsItem?.querySelector('.news-item-media') as HTMLImageElement
+    const date = newsItem?.querySelector('.news-item-header > .news-item-topline')
+    const title = newsItem?.querySelector('.news-item-header > h1')
+    const content = newsItem?.querySelector('.news-content')
+
+    feed.addItem({
+        title: title?.textContent || 'No title',
+        id: fullLink,
+        link: fullLink,
+        description: content?.textContent || 'No content',
+        content: image?.src ? image.outerHTML + content?.outerHTML : content?.outerHTML,
+        image: image?.src,
+        date: new Date(date?.textContent || Date.now()), // TODO: extract date from the item
+    })
+}
+
+const promises: Promise<void>[] = []
 newsLists.forEach((newsList) => {
     const items = newsList.querySelectorAll('.news-item')
 
-    items.forEach((item) => {
-        const image = item.querySelector('.news-image') as HTMLImageElement | null
-        const header = item.querySelector('.news-item-header')
-        const content = item.querySelector('.news-content')
-        const link = item.querySelector('a')
-
-        if (!link) {
-            console.log(`
-image: ${image ? 'ok' : 'missing'},
-header: ${header ? 'ok' : 'missing'},
-content: ${content ? 'ok' : 'missing'},
-link: ${link ? 'ok' : 'missing'}`)
-            return
-        }
-
-        if (image) {
-            image.alt = header?.textContent || ""
-        }
-
-
-        feed.addItem({
-            title: header?.textContent || 'No title',
-            id: link.href,
-            link: link.href,
-            description: content?.textContent || 'No content',
-            content: image?.src ? image.outerHTML + content?.outerHTML : content?.outerHTML,
-            image: image?.src,
-            date: new Date(), // TODO: extract date from the item
-        })
-    })
+    items.forEach((item) => promises.push(extractFromItem(item)))
 })
+await Promise.all(promises)
 
 Bun.write("./dist/rss.xml", feed.rss2())
 Bun.write("./dist/feed.json", feed.json1())
