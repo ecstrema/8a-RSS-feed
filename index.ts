@@ -68,8 +68,8 @@ async function extractFromItem(item: Element) {
         id: fullLink,
         link: fullLink,
         description: content?.textContent || 'No content',
-        content: image?.src ? image.outerHTML + content?.outerHTML : content?.outerHTML,
         image: image?.src,
+        content: content?.outerHTML,
         date: new Date(date?.textContent || Date.now()), // TODO: extract date from the item
     })
 }
@@ -81,6 +81,8 @@ newsLists.forEach((newsList) => {
     items.forEach((item) => promises.push(extractFromItem(item)))
 })
 await Promise.all(promises)
+
+console.log(`found ${feed.items.length} items`)
 
 Bun.write("./dist/rss.xml", feed.rss2())
 Bun.write("./dist/feed.json", feed.json1())
