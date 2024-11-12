@@ -4,8 +4,8 @@ on:
     branches:
       - main
   schedule:
-    # Run every day at 6:35, 12:35, and 18:35 (UTC)
-    - cron:  '35 0-23 * * *'
+    # Run every day at noon and midnight (UTC)
+    - cron:  '0 0,12 * * *'
 jobs:
   build:
     runs-on: ubuntu-latest
