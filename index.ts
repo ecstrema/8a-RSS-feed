@@ -258,6 +258,22 @@ async function collectArticleCandidatesFromPage(url: string): Promise<Array<Reco
     }
   }
 
+  // Fallback: any link pointing at a news article page.
+  for (const anchor of document.querySelectorAll('a[href*="/news/"]')) {
+    const href = toAbsoluteUrl(anchor.getAttribute('href'));
+    if (!href || seen.has(href) || /\/news\/?$/.test(new URL(href).pathname)) continue;
+    const title = findFirstText(anchor, TITLE_SELECTORS) ?? cleanText(anchor.textContent ?? null);
+    if (!title) continue;
+    seen.add(href);
+    candidates.push({
+      url: href,
+      title,
+      date: findFirstText(anchor, DATE_SELECTORS),
+      description: undefined,
+      image: selectBestImage(anchor),
+    });
+  }
+
   for (const article of extractJsonLdArticles(document)) {
     const normalized = normalizeCandidate(article);
     if (!normalized) continue;
@@ -277,8 +293,7 @@ async function loadArticleDetails(url: string): Promise<{ title: string; descrip
     findFirstText(document.querySelector('article'), TITLE_SELECTORS) ??
     findFirstText(document.body, TITLE_SELECTORS) ??
     document.querySelector('meta[property="og:title"]')?.getAttribute('content') ??
-    document.title ||
-    'Untitled article';
+    (document.title || 'Untitled article');
 
   const dateText =
     findFirstText(document.querySelector('article'), DATE_SELECTORS) ??
