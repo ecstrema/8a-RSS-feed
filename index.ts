@@ -3,14 +3,19 @@ import { Feed } from '@numbered/feed';
 
 const BASE_URL = 'https://www.8a.nu';
 const NEWS_URL = `${BASE_URL}/news`;
+const IMAGE_CDN = 'https://d3byf4kaqtov0k.cloudfront.net/';
 
 // Where the previously generated feed is published (GitHub Pages). Its items are
 // reused, so each run only needs the news listing plus pages of genuinely new articles.
 const PUBLISHED_FEED_URL = 'https://ecstrema.github.io/8a-RSS-feed';
 const FEED_FILES = ['rss.xml', 'atom.xml', 'feed.json'];
 
+// Keep the feed small: at most MAX_ITEMS, and each output file under MAX_FEED_BYTES
+// (oldest items are dropped first).
+const MAX_ITEMS = 50;
+const MAX_FEED_BYTES = 512 * 1024;
+
 // Be polite: few requests, spaced out.
-const MAX_ITEMS = 100; // items kept in the feed
 const MAX_ARTICLE_FETCHES = 10; // article pages fetched per run (only for new items lacking content)
 const REQUEST_DELAY_MS = 2000;
 const USER_AGENT = 'Mozilla/5.0 (compatible; 8a-rss-feed/1.0; +https://github.com/ecstrema/8a-RSS-feed)';
@@ -22,9 +27,10 @@ type Item = {
   title: string;
   content: string; // HTML
   summary: string; // plain text
-  image?: string;
   published: Date;
 };
+
+type Listed = Item & { complete: boolean };
 
 /** Thrown when 8a.nu answers with a Cloudflare challenge/block page or a rate limit. */
 class BlockedError extends Error {}
@@ -38,11 +44,15 @@ function cleanText(value: string | null | undefined): string {
   return (value ?? '').replace(/\s+/g, ' ').trim();
 }
 
-function toAbsoluteUrl(value: string | null | undefined): string | undefined {
+function escapeHtml(value: string): string {
+  return value.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/"/g, '&quot;');
+}
+
+function toAbsoluteUrl(value: string | null | undefined, base = BASE_URL): string | undefined {
   const candidate = value?.trim();
   if (!candidate || candidate.startsWith('data:')) return undefined;
   try {
-    return new URL(candidate, BASE_URL).toString();
+    return new URL(candidate, base).toString();
   } catch {
     return undefined;
   }
@@ -61,38 +71,42 @@ function toArticleUrl(href: string | null | undefined): string | undefined {
 
 const MONTHS = ['january', 'february', 'march', 'april', 'may', 'june', 'july', 'august', 'september', 'october', 'november', 'december'];
 
-/** Parses 8a.nu's "17 November 2026" (or any ISO date). */
+/**
+ * Parses 8a.nu dates: the payload's "2026-11-18T11:05:00" (no zone given; it matches
+ * UTC) or the page's "17 November 2026".
+ */
 function parseDate(raw: string | null | undefined): Date | undefined {
   const value = cleanText(raw);
+  if (!value) return undefined;
+  if (/^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}(:\d{2}(\.\d+)?)?$/.test(value)) return new Date(`${value}Z`);
   const match = value.match(/(\d{1,2})\s+([A-Za-z]+)\s+(\d{4})/);
   if (match) {
     const month = MONTHS.indexOf(match[2].toLowerCase());
     if (month >= 0) return new Date(Date.UTC(Number(match[3]), month, Number(match[1])));
   }
   const parsed = new Date(value);
-  return value && !Number.isNaN(parsed.getTime()) ? parsed : undefined;
+  return Number.isNaN(parsed.getTime()) ? undefined : parsed;
 }
 
-function firstImage(node: Element | null | undefined): string | undefined {
-  if (!node) return undefined;
-  for (const img of Array.from(node.querySelectorAll('img.news-image, img'))) {
-    const src =
-      toAbsoluteUrl(img.getAttribute('src')) ??
-      toAbsoluteUrl(img.getAttribute('data-src')) ??
-      toAbsoluteUrl(img.getAttribute('srcset')?.split(/[\s,]+/)[0]);
-    if (src && !/\/images\/vl-logos\//.test(src)) return src; // never the site logo
-  }
-  return undefined;
+function youtubeId(src: string | null | undefined): string | undefined {
+  return src?.match(/(?:youtube(?:-nocookie)?\.com\/(?:embed\/|watch\?v=)|youtu\.be\/)([\w-]{11})/)?.[1];
 }
 
-function youtubeThumbnail(embedSrc: string | undefined): string | undefined {
-  const id = embedSrc?.match(/youtube(?:-nocookie)?\.com\/embed\/([\w-]+)/)?.[1];
-  return id ? `https://img.youtube.com/vi/${id}/hqdefault.jpg` : undefined;
+/**
+ * A YouTube player for feed readers. Readers that allow iframes (Feedly, Inoreader,
+ * NetNewsWire, Miniflux, ...) play it inline; the others strip the iframe and show the
+ * thumbnail, which links to the video.
+ */
+function youtubeEmbed(id: string): string {
+  return [
+    `<iframe width="560" height="315" src="https://www.youtube.com/embed/${id}" title="YouTube video" frameborder="0" allow="accelerometer; clipboard-write; encrypted-media; gyroscope; picture-in-picture; web-share" allowfullscreen></iframe>`,
+    `<p><a href="https://www.youtube.com/watch?v=${id}"><img src="https://img.youtube.com/vi/${id}/hqdefault.jpg" alt="▶ Watch on YouTube" width="480" height="360"></a><br><a href="https://www.youtube.com/watch?v=${id}">▶ Watch on YouTube</a></p>`,
+  ].join('\n');
 }
 
 function summarize(html: string, maxLength = 300): string {
   const { document } = parseHTML(`<!doctype html><html><body>${html}</body></html>`);
-  for (const br of Array.from(document.querySelectorAll('br'))) br.replaceWith(' ');
+  for (const el of Array.from(document.querySelectorAll('br, p, div'))) el.after(' ');
   const text = cleanText(document.body.textContent);
   if (text.length <= maxLength) return text;
   const cut = text.slice(0, maxLength);
@@ -100,38 +114,44 @@ function summarize(html: string, maxLength = 300): string {
   return (sentenceEnd > maxLength / 2 ? cut.slice(0, sentenceEnd + 1) : `${cut.replace(/\s+\S*$/, '')}…`).trim();
 }
 
-/** Turns a `.news-content` element into readable, self-contained HTML for feed readers. */
-function buildContent(newsContent: Element | null | undefined, image: string | undefined, videoSrc: string | undefined, url: string): string {
+/**
+ * Builds readable, self-contained HTML for feed readers: the article image once at the
+ * top (unless the body already shows it), the article body with absolute links, and
+ * YouTube videos as playable embeds.
+ */
+function buildContent(bodyHtml: string, opts: { url: string; image?: string; videoId?: string }): string {
+  const { document } = parseHTML(`<!doctype html><html><body>${bodyHtml}</body></html>`);
+  const body = document.body;
+
+  for (const el of Array.from(body.querySelectorAll('[href]'))) {
+    const href = toAbsoluteUrl(el.getAttribute('href'));
+    if (href) el.setAttribute('href', href);
+  }
+  for (const el of Array.from(body.querySelectorAll('[src]'))) {
+    const src = toAbsoluteUrl(el.getAttribute('src'));
+    if (src) el.setAttribute('src', src);
+  }
+
+  // Replace YouTube iframes with a clean embed plus a thumbnail link fallback.
+  const embedded = new Set<string>();
+  for (const iframe of Array.from(body.querySelectorAll('iframe'))) {
+    const id = youtubeId(iframe.getAttribute('src'));
+    if (!id) continue;
+    embedded.add(id);
+    const wrapper = document.createElement('div');
+    wrapper.innerHTML = youtubeEmbed(id);
+    iframe.replaceWith(wrapper);
+  }
+
   const parts: string[] = [];
-
-  if (image) parts.push(`<p><img src="${image}" alt="" style="max-width:100%;height:auto"></p>`);
-
-  if (newsContent) {
-    // Make links and media absolute so they work outside 8a.nu.
-    for (const el of Array.from(newsContent.querySelectorAll('[href]'))) {
-      const href = toAbsoluteUrl(el.getAttribute('href'));
-      if (href) el.setAttribute('href', href);
-    }
-    for (const el of Array.from(newsContent.querySelectorAll('[src]'))) {
-      const src = toAbsoluteUrl(el.getAttribute('src'));
-      if (src) el.setAttribute('src', src);
-    }
-    // Many readers strip iframes: add a plain link next to each embedded video.
-    for (const iframe of Array.from(newsContent.querySelectorAll('iframe[src]'))) {
-      const src = iframe.getAttribute('src')!;
-      const link = newsContent.ownerDocument.createElement('p');
-      link.innerHTML = `<a href="${src.replace('/embed/', '/watch?v=').replace(/\?si=.*$/, '')}">▶ Watch the video</a>`;
-      iframe.after(link);
-    }
-    parts.push(newsContent.innerHTML.trim());
+  const bodyImages = Array.from(body.querySelectorAll('img')).map((img) => img.getAttribute('src'));
+  if (opts.image && !bodyImages.includes(opts.image)) {
+    parts.push(`<p><img src="${escapeHtml(opts.image)}" alt="" style="max-width:100%;height:auto"></p>`);
   }
-
-  if (videoSrc && !parts.some((part) => part.includes(videoSrc))) {
-    parts.push(`<p><a href="${videoSrc}">▶ Watch the video</a></p>`);
-  }
-
-  parts.push(`<p><a href="${url}">Read on 8a.nu</a></p>`);
-  return parts.join('\n');
+  parts.push(body.innerHTML.trim());
+  if (opts.videoId && !embedded.has(opts.videoId)) parts.push(youtubeEmbed(opts.videoId));
+  parts.push(`<p><a href="${escapeHtml(opts.url)}">Read on 8a.nu</a></p>`);
+  return parts.filter(Boolean).join('\n');
 }
 
 // ---------------------------------------------------------------------------
@@ -158,56 +178,135 @@ async function fetchHtml(url: string): Promise<string> {
   return body;
 }
 
-/** Parses the /news listing. Each entry already carries title, date, image and content. */
-function parseNewsList(html: string): Array<Item & { hasContent: boolean }> {
-  const { document } = parseHTML(html);
-  const items: Array<Item & { hasContent: boolean }> = [];
-  const seen = new Set<string>();
+// ---------------------------------------------------------------------------
+// Parsing
 
-  for (const entry of Array.from(document.querySelectorAll('.news-list .news-item'))) {
+/**
+ * Decodes Nuxt's `__NUXT_DATA__` payload (devalue format: a flat array where objects
+ * and arrays reference other entries by index).
+ */
+function decodeNuxtPayload(text: string): unknown {
+  const table = JSON.parse(text) as unknown[];
+  const cache = new Map<number, unknown>();
+  const WRAPPERS = new Set(['Reactive', 'ShallowReactive', 'Ref', 'ShallowRef']);
+
+  const revive = (index: number): unknown => {
+    if (index === -1) return undefined;
+    if (index < 0) return null; // holes, NaN, infinities: not needed here
+    if (cache.has(index)) return cache.get(index);
+    const value = table[index];
+    if (Array.isArray(value)) {
+      if (typeof value[0] === 'string' && WRAPPERS.has(value[0])) return revive(value[1] as number);
+      if (value[0] === 'Date') return value[1];
+      if (typeof value[0] === 'string' && /^(Set|Map|BigInt|RegExp|EmptyRef|EmptyShallowRef|null)$/.test(value[0])) return null;
+      const out: unknown[] = [];
+      cache.set(index, out);
+      for (const ref of value) out.push(revive(ref as number));
+      return out;
+    }
+    if (value && typeof value === 'object') {
+      const out: Record<string, unknown> = {};
+      cache.set(index, out);
+      for (const [key, ref] of Object.entries(value)) out[key] = revive(ref as number);
+      return out;
+    }
+    return value;
+  };
+
+  return revive(0);
+}
+
+/** All news records found in a page's payload ({slug, title, content, datePublished, images, ...}). */
+function payloadNews(document: Document): Array<Record<string, any>> {
+  const script = document.querySelector('script#__NUXT_DATA__');
+  if (!script?.textContent) return [];
+
+  let root: unknown;
+  try {
+    root = decodeNuxtPayload(script.textContent);
+  } catch (error) {
+    console.warn('Could not decode the Nuxt payload:', error instanceof Error ? error.message : error);
+    return [];
+  }
+
+  const found: Array<Record<string, any>> = [];
+  const seen = new Set<unknown>();
+  const visit = (value: unknown, depth: number) => {
+    if (!value || typeof value !== 'object' || seen.has(value) || depth > 12) return;
+    seen.add(value);
+    const record = value as Record<string, any>;
+    if (!Array.isArray(value) && typeof record.slug === 'string' && typeof record.title === 'string' && 'datePublished' in record) {
+      found.push(record);
+      return;
+    }
+    for (const child of Object.values(record)) visit(child, depth + 1);
+  };
+  visit(root, 0);
+  return found;
+}
+
+function itemFromPayload(record: Record<string, any>): Listed | undefined {
+  const url = toArticleUrl(`/news/${record.slug}`);
+  const title = cleanText(record.title);
+  if (!url || !title) return undefined;
+
+  const content = typeof record.content === 'string' ? record.content : '';
+  const fileName = Array.isArray(record.images) ? record.images.find((img: any) => img?.fileName)?.fileName : undefined;
+  const image = toAbsoluteUrl(fileName, IMAGE_CDN);
+  const videoId = youtubeId(record.videoId ? `https://www.youtube.com/embed/${record.videoId}` : undefined);
+
+  return {
+    url,
+    title,
+    content: buildContent(content, { url, image, videoId }),
+    summary: summarize(content) || title,
+    published: parseDate(record.datePublished) ?? new Date(),
+    complete: content.trim().length > 0 && !!parseDate(record.datePublished),
+  };
+}
+
+/** Fallback when the payload is missing: read the rendered listing markup. */
+function itemsFromMarkup(document: Document): Listed[] {
+  const items: Listed[] = [];
+  for (const entry of Array.from(document.querySelectorAll('.news-list .news-item, .news-page-container > .news-item'))) {
     const titleLink = entry.querySelector('h1 a, h2 a, h3 a, h4 a') ?? entry.querySelector('a[href*="/news/"]');
-    const url = toArticleUrl(titleLink?.getAttribute('href'));
+    const url = toArticleUrl(titleLink?.getAttribute('href')) ?? toArticleUrl(document.querySelector('link[rel="canonical"]')?.getAttribute('href'));
     const title = cleanText(entry.querySelector('h1, h2, h3, h4')?.textContent ?? titleLink?.textContent);
-    if (!url || !title || seen.has(url)) continue;
-    seen.add(url);
+    if (!url || !title) continue;
 
-    const newsContent = entry.querySelector('.news-content');
-    const videoSrc = toAbsoluteUrl(entry.querySelector('.video-container iframe, .news-content iframe')?.getAttribute('src'));
-    const image = firstImage(entry.querySelector('.news-image-container') ?? entry) ?? youtubeThumbnail(videoSrc);
-    const summary = summarize(newsContent?.innerHTML ?? '') || title; // before buildContent mutates it
-    const content = buildContent(newsContent, image, videoSrc, url);
+    const img = entry.querySelector('img.news-image');
+    const image = toAbsoluteUrl(img?.getAttribute('src'));
+    const content = entry.querySelector('.news-content')?.innerHTML ?? '';
+    const videoId = youtubeId(entry.querySelector('.video-container iframe')?.getAttribute('src'));
+    const date = parseDate(entry.querySelector('.news-item-topline')?.textContent);
 
     items.push({
       url,
       title,
-      content,
-      summary,
-      image,
-      published: parseDate(entry.querySelector('.news-item-topline')?.textContent) ?? new Date(),
-      hasContent: cleanText(newsContent?.textContent).length > 0 || !!newsContent?.querySelector('iframe, img'),
+      content: buildContent(content, { url, image, videoId }),
+      summary: summarize(content) || title,
+      published: date ?? new Date(),
+      // The rendered listing truncates long articles ("…") and has no time of day.
+      complete: false,
     });
   }
-
   return items;
 }
 
-/** Fetches an article page, for new listing entries whose content was empty. */
-async function fetchArticle(listed: Item): Promise<Item> {
-  const { document } = parseHTML(await fetchHtml(listed.url));
-  const article = document.querySelector('.news-page-container .news-item');
-  if (!article) return listed;
+function parseNewsPage(html: string): Listed[] {
+  const { document } = parseHTML(html);
+  const fromPayload = payloadNews(document).map(itemFromPayload).filter((item): item is Listed => !!item);
+  const items = fromPayload.length > 0 ? fromPayload : itemsFromMarkup(document);
 
-  const newsContent = article.querySelector('.news-content');
-  const image = firstImage(article) ?? listed.image;
-  const summary = summarize(newsContent?.innerHTML ?? '') || listed.summary;
-  return {
-    url: listed.url,
-    title: cleanText(article.querySelector('h1')?.textContent) || listed.title,
-    content: buildContent(newsContent, image, undefined, listed.url),
-    summary,
-    image,
-    published: parseDate(article.querySelector('.news-item-topline')?.textContent) ?? listed.published,
-  };
+  const unique = new Map<string, Listed>();
+  for (const item of items) if (!unique.has(item.url)) unique.set(item.url, item);
+  return Array.from(unique.values());
+}
+
+/** Fetches an article page, for new listing entries that lacked content or a date. */
+async function fetchArticle(listed: Listed): Promise<Item> {
+  const items = parseNewsPage(await fetchHtml(listed.url));
+  return items.find((item) => item.url === listed.url) ?? listed;
 }
 
 /** Items from the feed published by the previous run (JSON Feed 1.0). */
@@ -220,15 +319,13 @@ async function loadPreviousItems(): Promise<Item[]> {
     const items: Item[] = [];
     for (const raw of json.items ?? []) {
       const url = toArticleUrl(raw.url ?? raw.id);
-      // Skip entries produced by older versions of this script (site logo instead of the
-      // article image): they get rebuilt from the listing if still present there.
+      // Skip entries produced by the first version of this script (site logo instead of the article image).
       if (!url || !raw.title || /\/images\/vl-logos\//.test(raw.image ?? '')) continue;
       items.push({
         url,
         title: raw.title,
         content: raw.content_html ?? raw.content_text ?? raw.title,
         summary: raw.summary ?? raw.title,
-        image: raw.image,
         published: new Date(raw.date_published ?? raw.date_modified ?? Date.now()),
       });
     }
@@ -243,7 +340,7 @@ async function loadPreviousItems(): Promise<Item[]> {
 // ---------------------------------------------------------------------------
 // Output
 
-async function writeFeed(items: Item[]): Promise<void> {
+function renderFeed(items: Item[]): Record<string, string> {
   const feed = new Feed({
     title: '8a.nu news',
     description: '8a.nu climbing and vertical life news feed',
@@ -268,21 +365,33 @@ async function writeFeed(items: Item[]): Promise<void> {
   });
 
   for (const item of items) {
+    // No `image`: it would become an enclosure that readers show a second time below
+    // the article. The image is already at the top of the content.
     feed.addItem({
       title: item.title,
       id: item.url,
       link: item.url,
       description: item.summary,
       content: item.content,
-      image: item.image,
       date: item.published,
       published: item.published,
     });
   }
 
-  await Bun.write(`${distDir}/rss.xml`, feed.rss2());
-  await Bun.write(`${distDir}/feed.json`, feed.json1());
-  await Bun.write(`${distDir}/atom.xml`, feed.atom1());
+  return { 'rss.xml': feed.rss2(), 'atom.xml': feed.atom1(), 'feed.json': feed.json1() };
+}
+
+/** Writes the feeds, dropping the oldest items until every file fits MAX_FEED_BYTES. */
+async function writeFeed(items: Item[]): Promise<number> {
+  let kept = items.slice(0, MAX_ITEMS);
+  let files = renderFeed(kept);
+  const size = () => Math.max(...Object.values(files).map((text) => Buffer.byteLength(text)));
+  while (kept.length > 1 && size() > MAX_FEED_BYTES) {
+    kept = kept.slice(0, Math.max(1, Math.floor(kept.length * 0.9)));
+    files = renderFeed(kept);
+  }
+  for (const [name, text] of Object.entries(files)) await Bun.write(`${distDir}/${name}`, text);
+  return kept.length;
 }
 
 /** Re-publish the last deployed feed files untouched. */
@@ -305,20 +414,21 @@ async function restorePublishedFeed(): Promise<boolean> {
 
 async function main(): Promise<void> {
   const previous = await loadPreviousItems();
-  const known = new Map(previous.map((item) => [item.url, item]));
+  const items = new Map(previous.map((item) => [item.url, item]));
 
-  const listed = parseNewsList(await fetchHtml(NEWS_URL));
+  const listed = parseNewsPage(await fetchHtml(NEWS_URL));
   if (listed.length === 0) {
     throw new Error('No news articles were found on 8a.nu using the current structure.');
   }
-
-  const fresh = listed.filter((item) => !known.has(item.url));
+  const fresh = listed.filter((item) => !items.has(item.url));
   console.log(`Found ${listed.length} articles on ${NEWS_URL}, ${fresh.length} new.`);
 
+  // Articles still on the listing are refreshed from it (no extra request). Only new
+  // articles with missing content or date get their own page fetched.
   let fetches = 0;
-  for (const item of fresh) {
+  for (const item of listed) {
     let resolved: Item = item;
-    if (!item.hasContent && fetches < MAX_ARTICLE_FETCHES) {
+    if (!item.complete && !items.has(item.url) && fetches < MAX_ARTICLE_FETCHES) {
       fetches++;
       try {
         resolved = await fetchArticle(item);
@@ -326,17 +436,16 @@ async function main(): Promise<void> {
         console.warn(`Using listing data for ${item.url}:`, error instanceof Error ? error.message : error);
         if (error instanceof BlockedError) fetches = MAX_ARTICLE_FETCHES; // stop fetching
       }
+    } else if (!item.complete && items.has(item.url)) {
+      continue; // keep the previously published (complete) version
     }
-    const { hasContent, ...clean } = resolved as Item & { hasContent?: boolean };
-    known.set(clean.url, clean);
+    const { complete, ...clean } = resolved as Listed;
+    items.set(clean.url, clean);
   }
 
-  const items = Array.from(known.values())
-    .sort((a, b) => b.published.getTime() - a.published.getTime())
-    .slice(0, MAX_ITEMS);
-
-  await writeFeed(items);
-  console.log(`Wrote ${items.length} items (${fresh.length} new, ${fetches} article pages fetched).`);
+  const sorted = Array.from(items.values()).sort((a, b) => b.published.getTime() - a.published.getTime());
+  const written = await writeFeed(sorted);
+  console.log(`Wrote ${written} items (${fresh.length} new, ${fetches} article pages fetched).`);
 }
 
 await Bun.write(`${distDir}/.keep`, '');
