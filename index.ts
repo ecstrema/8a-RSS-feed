@@ -2,13 +2,19 @@ import { parseHTML } from 'linkedom';
 import { Feed } from '@numbered/feed';
 
 const BASE_URL = 'https://www.8a.nu';
-const CANDIDATE_URLS = [
-  BASE_URL,
-  `${BASE_URL}/news`,
-  `${BASE_URL}/news/`,
-  `${BASE_URL}/articles`,
-  `${BASE_URL}/articles/`,
-];
+const CANDIDATE_URLS = [BASE_URL, `${BASE_URL}/news`];
+
+// Where the previously generated feed is published (GitHub Pages). Used as a
+// fallback when 8a.nu refuses to serve us, so the feed goes stale instead of empty.
+const PUBLISHED_FEED_URL = 'https://ecstrema.github.io/8a-RSS-feed';
+const FEED_FILES = ['rss.xml', 'atom.xml', 'feed.json'];
+
+// Be polite: few requests, spaced out.
+const MAX_ARTICLES = 20;
+const REQUEST_DELAY_MS = 2000;
+
+/** Thrown when 8a.nu answers with Cloudflare's bot challenge or a rate limit. */
+class BlockedError extends Error {}
 
 const LIST_SELECTORS = [
   '.news-list',
@@ -214,12 +220,36 @@ function appendFeedItem(url: string, title: string, description: string | undefi
   });
 }
 
+const sleep = (ms: number) => new Promise((resolve) => setTimeout(resolve, ms));
+
+let requestCount = 0;
+
 async function fetchHtml(url: string): Promise<string> {
+  if (requestCount++ > 0) await sleep(REQUEST_DELAY_MS);
+
   const response = await fetch(url, { headers: { 'User-Agent': 'Mozilla/5.0 (compatible; 8a-rss-feed/1.0; +https://github.com/ecstrema/8a-RSS-feed)' } });
+  const body = await response.text();
+
+  const challenged =
+    response.headers.get('cf-mitigated') === 'challenge' ||
+    (/<title>Just a moment\.\.\.<\/title>/i.test(body) && /_cf_chl_opt/.test(body));
+  if (challenged || response.status === 429) {
+    throw new BlockedError(`Blocked by 8a.nu anti-scraping protection on ${url} (${response.status})`);
+  }
   if (!response.ok) {
     throw new Error(`Failed to fetch ${url}: ${response.status} ${response.statusText}`);
   }
-  return await response.text();
+  return body;
+}
+
+/** Only keep real news article pages, e.g. https://www.8a.nu/news/some-slug */
+function isNewsArticleUrl(url: string): boolean {
+  try {
+    const parsed = new URL(url);
+    return /(^|\.)8a\.nu$/.test(parsed.hostname) && /^\/news\/[^/]+\/?$/.test(parsed.pathname);
+  } catch {
+    return false;
+  }
 }
 
 async function collectArticleCandidatesFromPage(url: string): Promise<Array<Record<string, any>>> {
@@ -325,17 +355,20 @@ async function loadArticleDetails(url: string): Promise<{ title: string; descrip
   };
 }
 
+type ListedItem = { url: string; title: string; description?: string; image?: string; published: Date };
+
 async function index8aNews(): Promise<void> {
-  const uniqueItems = new Map<string, { url: string; title: string; description?: string; image?: string; published: Date }>();
+  const uniqueItems = new Map<string, ListedItem>();
 
   for (const candidateUrl of CANDIDATE_URLS) {
     try {
       const items = await collectArticleCandidatesFromPage(candidateUrl);
       for (const item of items) {
-        if (!item.url || !item.title) continue;
-        if (!uniqueItems.has(item.url)) {
-          uniqueItems.set(item.url, {
-            url: item.url,
+        const url = item.url?.split('#')[0]; // e.g. drop "#comments" duplicates
+        if (!url || !item.title || !isNewsArticleUrl(url)) continue;
+        if (!uniqueItems.has(url)) {
+          uniqueItems.set(url, {
+            url,
             title: cleanText(item.title),
             description: item.description ? cleanText(item.description) : undefined,
             image: item.image ? toAbsoluteUrl(item.image) ?? undefined : undefined,
@@ -344,37 +377,70 @@ async function index8aNews(): Promise<void> {
         }
       }
     } catch (error) {
+      if (error instanceof BlockedError) throw error; // No point hammering other pages.
       console.warn(`Skipping ${candidateUrl}:`, error instanceof Error ? error.message : error);
     }
   }
 
-  const articleList = Array.from(uniqueItems.values());
+  const articleList = Array.from(uniqueItems.values()).slice(0, MAX_ARTICLES);
   if (articleList.length === 0) {
     throw new Error('No news articles were found on 8a.nu using the current structure.');
   }
 
+  let blocked = false;
   for (const item of articleList) {
+    if (blocked) {
+      appendFeedItem(item.url, item.title, item.description, item.image, item.published);
+      continue;
+    }
     try {
       const details = await loadArticleDetails(item.url);
       const title = details.title || item.title;
       appendFeedItem(item.url, title, details.description ?? item.description, details.image ?? item.image, details.published);
     } catch (error) {
+      // Once blocked, stop fetching article pages and use the listing data for the rest.
+      if (error instanceof BlockedError) blocked = true;
       console.warn(`Failed to resolve article details for ${item.url}:`, error instanceof Error ? error.message : error);
       appendFeedItem(item.url, item.title, item.description, item.image, item.published);
     }
   }
 
-  if (feed.items.length === 0) {
-    throw new Error('Feed generation produced zero items.');
-  }
-
-  await Bun.write('./dist/rss.xml', feed.rss2());
-  await Bun.write('./dist/feed.json', feed.json1());
-  await Bun.write('./dist/atom.xml', feed.atom1());
+  await Bun.write(`${distDir}/rss.xml`, feed.rss2());
+  await Bun.write(`${distDir}/feed.json`, feed.json1());
+  await Bun.write(`${distDir}/atom.xml`, feed.atom1());
 
   console.log(`Indexed ${feed.items.length} 8a.nu news items into the feed.`);
 }
 
+/** Re-publish the last deployed feed so subscribers keep what they had. */
+async function restorePublishedFeed(): Promise<boolean> {
+  try {
+    for (const file of FEED_FILES) {
+      const response = await fetch(`${PUBLISHED_FEED_URL}/${file}`);
+      if (!response.ok) throw new Error(`${file}: ${response.status} ${response.statusText}`);
+      await Bun.write(`${distDir}/${file}`, await response.text());
+    }
+    return true;
+  } catch (error) {
+    console.warn('Could not restore the previously published feed:', error instanceof Error ? error.message : error);
+    return false;
+  }
+}
+
 const distDir = './dist';
 await Bun.write(`${distDir}/.keep`, '');
-await index8aNews();
+
+try {
+  await index8aNews();
+} catch (error) {
+  const reason = error instanceof Error ? error.message : String(error);
+  const restored = await restorePublishedFeed();
+  if (!restored) {
+    // Nothing to fall back on: publish a valid, empty feed rather than nothing.
+    await Bun.write(`${distDir}/rss.xml`, feed.rss2());
+    await Bun.write(`${distDir}/feed.json`, feed.json1());
+    await Bun.write(`${distDir}/atom.xml`, feed.atom1());
+  }
+  // GitHub Actions annotation, so the stale feed is visible without failing the build.
+  console.log(`::warning title=8a.nu scrape failed::${reason} — ${restored ? 'kept the previously published feed' : 'published an empty feed'}.`);
+}
