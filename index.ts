@@ -2,238 +2,154 @@ import { parseHTML } from 'linkedom';
 import { Feed } from '@numbered/feed';
 
 const BASE_URL = 'https://www.8a.nu';
-const CANDIDATE_URLS = [BASE_URL, `${BASE_URL}/news`];
+const NEWS_URL = `${BASE_URL}/news`;
 
-// Where the previously generated feed is published (GitHub Pages). Used as a
-// fallback when 8a.nu refuses to serve us, so the feed goes stale instead of empty.
+// Where the previously generated feed is published (GitHub Pages). Its items are
+// reused, so each run only needs the news listing plus pages of genuinely new articles.
 const PUBLISHED_FEED_URL = 'https://ecstrema.github.io/8a-RSS-feed';
 const FEED_FILES = ['rss.xml', 'atom.xml', 'feed.json'];
 
 // Be polite: few requests, spaced out.
-const MAX_ARTICLES = 20;
+const MAX_ITEMS = 100; // items kept in the feed
+const MAX_ARTICLE_FETCHES = 10; // article pages fetched per run (only for new items lacking content)
 const REQUEST_DELAY_MS = 2000;
+const USER_AGENT = 'Mozilla/5.0 (compatible; 8a-rss-feed/1.0; +https://github.com/ecstrema/8a-RSS-feed)';
 
-/** Thrown when 8a.nu answers with Cloudflare's bot challenge or a rate limit. */
+const distDir = './dist';
+
+type Item = {
+  url: string;
+  title: string;
+  content: string; // HTML
+  summary: string; // plain text
+  image?: string;
+  published: Date;
+};
+
+/** Thrown when 8a.nu answers with a Cloudflare challenge/block page or a rate limit. */
 class BlockedError extends Error {}
 
-const LIST_SELECTORS = [
-  '.news-list',
-  '.news-feed',
-  '.news-items',
-  '.news-item-list',
-  '.article-list',
-  '.posts',
-  '.post-list',
-  '.featured-posts',
-  '.latest-news',
-  'article',
-  '.news-item',
-  '.article-item',
-  '.post-card',
-  '.article-card',
-  '.news-card',
-  '.entry',
-];
+// ---------------------------------------------------------------------------
+// Helpers
 
-const TITLE_SELECTORS = ['h1', 'h2', 'h3', '.title', '.entry-title', '.news-title', '.article-title'];
-const DATE_SELECTORS = ['time', '[datetime]', '.date', '.published', '.news-date', '.article-date', '.meta time'];
-const CONTENT_SELECTORS = [
-  '.news-content',
-  '.article-content',
-  '.entry-content',
-  '.post-content',
-  '.content',
-  'main .content',
-  'main article',
-  'article',
-];
-const DESC_SELECTORS = ['.summary', '.excerpt', '.teaser', '.description', '.lead', 'p'];
-
-const feed = new Feed({
-  title: '8a.nu news',
-  description: '8a.nu climbing and vertical life news feed',
-  id: BASE_URL,
-  link: BASE_URL,
-  language: 'en',
-  image: `${BASE_URL}/favicon.png`,
-  favicon: `${BASE_URL}/favicon.png`,
-  copyright: 'All rights reserved, Vertical Life',
-  updated: new Date(),
-  generator: "Ecstrema's 8a.nu news feed generator",
-  feedLinks: {
-    rss: `${BASE_URL}/rss.xml`,
-    json: `${BASE_URL}/feed.json`,
-    atom: `${BASE_URL}/atom.xml`,
-  },
-  author: {
-    name: 'ecstrema',
-    email: 'remimarche@gmail.com',
-    link: 'https://ecstrema.com',
-  },
-});
+const sleep = (ms: number) => new Promise((resolve) => setTimeout(resolve, ms));
 
 function cleanText(value: string | null | undefined): string {
   return (value ?? '').replace(/\s+/g, ' ').trim();
 }
 
-function toAbsoluteUrl(value: string | null | undefined): string | null {
-  if (!value) return null;
-  const candidate = value.trim();
-  if (!candidate) return null;
-  if (/^https?:\/\//i.test(candidate)) return candidate;
-  if (candidate.startsWith('//')) return `https:${candidate}`;
-  if (candidate.startsWith('/')) return new URL(candidate, BASE_URL).toString();
+function toAbsoluteUrl(value: string | null | undefined): string | undefined {
+  const candidate = value?.trim();
+  if (!candidate || candidate.startsWith('data:')) return undefined;
   try {
     return new URL(candidate, BASE_URL).toString();
   } catch {
-    return null;
+    return undefined;
   }
 }
 
-function parseDate(raw: string | null | undefined): Date {
+/** Canonical article URL, or undefined if it is not a news article (e.g. /news/some-slug). */
+function toArticleUrl(href: string | null | undefined): string | undefined {
+  const absolute = toAbsoluteUrl(href);
+  if (!absolute) return undefined;
+  const url = new URL(absolute);
+  if (!/(^|\.)8a\.nu$/.test(url.hostname) || !/^\/news\/[^/]+\/?$/.test(url.pathname)) return undefined;
+  url.hash = ''; // drop "#comments" etc.
+  url.search = '';
+  return url.toString();
+}
+
+const MONTHS = ['january', 'february', 'march', 'april', 'may', 'june', 'july', 'august', 'september', 'october', 'november', 'december'];
+
+/** Parses 8a.nu's "17 November 2026" (or any ISO date). */
+function parseDate(raw: string | null | undefined): Date | undefined {
   const value = cleanText(raw);
-  if (!value) return new Date();
-
+  const match = value.match(/(\d{1,2})\s+([A-Za-z]+)\s+(\d{4})/);
+  if (match) {
+    const month = MONTHS.indexOf(match[2].toLowerCase());
+    if (month >= 0) return new Date(Date.UTC(Number(match[3]), month, Number(match[1])));
+  }
   const parsed = new Date(value);
-  if (!Number.isNaN(parsed.getTime())) return parsed;
-
-  const match = value.match(/(\d{4}-\d{2}-\d{2})/);
-  if (match) return new Date(match[1]);
-
-  return new Date();
+  return value && !Number.isNaN(parsed.getTime()) ? parsed : undefined;
 }
 
-function findFirstText(node: Element | null | undefined, selectors: string[]): string | null {
-  if (!node) return null;
-
-  for (const selector of selectors) {
-    const match = node.querySelector(selector);
-    const text = cleanText(match?.textContent ?? null);
-    if (text) return text;
-  }
-
-  return null;
-}
-
-function selectBestImage(node: Element | null | undefined): string | undefined {
+function firstImage(node: Element | null | undefined): string | undefined {
   if (!node) return undefined;
-
-  const candidates = node.querySelectorAll('img[src]');
-  for (const img of candidates) {
-    const src = toAbsoluteUrl((img as HTMLImageElement).getAttribute('src') ?? img.getAttribute('data-src'));
-    if (src) return src;
+  for (const img of Array.from(node.querySelectorAll('img.news-image, img'))) {
+    const src =
+      toAbsoluteUrl(img.getAttribute('src')) ??
+      toAbsoluteUrl(img.getAttribute('data-src')) ??
+      toAbsoluteUrl(img.getAttribute('srcset')?.split(/[\s,]+/)[0]);
+    if (src && !/\/images\/vl-logos\//.test(src)) return src; // never the site logo
   }
-
   return undefined;
 }
 
-function extractDescription(node: Element | null | undefined): string | undefined {
-  if (!node) return undefined;
+function youtubeThumbnail(embedSrc: string | undefined): string | undefined {
+  const id = embedSrc?.match(/youtube(?:-nocookie)?\.com\/embed\/([\w-]+)/)?.[1];
+  return id ? `https://img.youtube.com/vi/${id}/hqdefault.jpg` : undefined;
+}
 
-  for (const selector of DESC_SELECTORS) {
-    const match = node.querySelector(selector);
-    if (match) {
-      const text = cleanText(match.textContent ?? null);
-      if (text) return text;
+function summarize(html: string, maxLength = 300): string {
+  const { document } = parseHTML(`<!doctype html><html><body>${html}</body></html>`);
+  for (const br of Array.from(document.querySelectorAll('br'))) br.replaceWith(' ');
+  const text = cleanText(document.body.textContent);
+  if (text.length <= maxLength) return text;
+  const cut = text.slice(0, maxLength);
+  const sentenceEnd = cut.lastIndexOf('. ');
+  return (sentenceEnd > maxLength / 2 ? cut.slice(0, sentenceEnd + 1) : `${cut.replace(/\s+\S*$/, '')}…`).trim();
+}
+
+/** Turns a `.news-content` element into readable, self-contained HTML for feed readers. */
+function buildContent(newsContent: Element | null | undefined, image: string | undefined, videoSrc: string | undefined, url: string): string {
+  const parts: string[] = [];
+
+  if (image) parts.push(`<p><img src="${image}" alt="" style="max-width:100%;height:auto"></p>`);
+
+  if (newsContent) {
+    // Make links and media absolute so they work outside 8a.nu.
+    for (const el of Array.from(newsContent.querySelectorAll('[href]'))) {
+      const href = toAbsoluteUrl(el.getAttribute('href'));
+      if (href) el.setAttribute('href', href);
     }
+    for (const el of Array.from(newsContent.querySelectorAll('[src]'))) {
+      const src = toAbsoluteUrl(el.getAttribute('src'));
+      if (src) el.setAttribute('src', src);
+    }
+    // Many readers strip iframes: add a plain link next to each embedded video.
+    for (const iframe of Array.from(newsContent.querySelectorAll('iframe[src]'))) {
+      const src = iframe.getAttribute('src')!;
+      const link = newsContent.ownerDocument.createElement('p');
+      link.innerHTML = `<a href="${src.replace('/embed/', '/watch?v=').replace(/\?si=.*$/, '')}">▶ Watch the video</a>`;
+      iframe.after(link);
+    }
+    parts.push(newsContent.innerHTML.trim());
   }
 
-  const fullText = cleanText(node.textContent ?? null);
-  return fullText.length > 0 ? fullText : undefined;
-}
-
-function extractJsonLdArticles(document: Document): Array<Record<string, any>> {
-  const results: Array<Record<string, any>> = [];
-  const seen = new Set<string>();
-
-  const visit = (value: any) => {
-    if (!value || typeof value !== 'object') return;
-
-    if (Array.isArray(value)) {
-      for (const item of value) visit(item);
-      return;
-    }
-
-    const typeValue = value['@type'];
-    const types = Array.isArray(typeValue) ? typeValue : [typeValue];
-    const normalizedTypes = types.map((type) => String(type).toLowerCase());
-    const isArticleLike =
-      normalizedTypes.some((type) => /article|news|blog|post|itemlist/.test(type)) ||
-      value['headline'] ||
-      value['name'] ||
-      value['url'];
-
-    if (isArticleLike && (value['url'] || value['headline'] || value['name'])) {
-      const url = toAbsoluteUrl(value['url'] ?? value['mainEntityOfPage']?.['@id'] ?? value['mainEntityOfPage'] ?? null);
-      const key = url ?? `${value['headline'] ?? value['name'] ?? ''}:${value['datePublished'] ?? ''}`;
-      if (key && !seen.has(key)) {
-        seen.add(key);
-        results.push(value);
-      }
-    }
-
-    for (const nested of Object.values(value)) visit(nested);
-  };
-
-  for (const script of document.querySelectorAll('script[type="application/ld+json"]')) {
-    const text = script.textContent ?? '';
-    if (!text) continue;
-    try {
-      const parsed = JSON.parse(text);
-      visit(parsed);
-    } catch {
-      // Ignore invalid JSON-LD blocks.
-    }
+  if (videoSrc && !parts.some((part) => part.includes(videoSrc))) {
+    parts.push(`<p><a href="${videoSrc}">▶ Watch the video</a></p>`);
   }
 
-  return results;
+  parts.push(`<p><a href="${url}">Read on 8a.nu</a></p>`);
+  return parts.join('\n');
 }
 
-function normalizeCandidate(raw: Record<string, any>): Record<string, any> | null {
-  const url = toAbsoluteUrl(raw['url'] ?? raw['mainEntityOfPage']?.['@id'] ?? raw['mainEntityOfPage'] ?? null);
-  const title = cleanText(raw['headline'] ?? raw['name'] ?? raw['title'] ?? null);
-  if (!url || !title) return null;
-
-  const image = Array.isArray(raw['image'])
-    ? toAbsoluteUrl(raw['image'][0]?.url ?? raw['image'][0] ?? null)
-    : toAbsoluteUrl(raw['image']?.url ?? raw['image'] ?? null);
-
-  return {
-    url,
-    title,
-    date: raw['datePublished'] ?? raw['dateModified'] ?? raw['published'] ?? raw['date'],
-    description: raw['description'] ?? raw['summary'] ?? raw['articleBody']?.slice(0, 220) ?? null,
-    image,
-  };
-}
-
-function appendFeedItem(url: string, title: string, description: string | undefined, image: string | undefined, published: Date) {
-  const id = url;
-  feed.addItem({
-    title,
-    id,
-    link: url,
-    description: description ?? title,
-    image,
-    date: published,
-    content: description ?? title,
-  });
-}
-
-const sleep = (ms: number) => new Promise((resolve) => setTimeout(resolve, ms));
+// ---------------------------------------------------------------------------
+// Fetching
 
 let requestCount = 0;
 
 async function fetchHtml(url: string): Promise<string> {
   if (requestCount++ > 0) await sleep(REQUEST_DELAY_MS);
 
-  const response = await fetch(url, { headers: { 'User-Agent': 'Mozilla/5.0 (compatible; 8a-rss-feed/1.0; +https://github.com/ecstrema/8a-RSS-feed)' } });
+  const response = await fetch(url, { headers: { 'User-Agent': USER_AGENT } });
   const body = await response.text();
 
-  const challenged =
+  const blocked =
+    response.status === 429 ||
     response.headers.get('cf-mitigated') === 'challenge' ||
-    (/<title>Just a moment\.\.\.<\/title>/i.test(body) && /_cf_chl_opt/.test(body));
-  if (challenged || response.status === 429) {
+    /<title>(Just a moment\.\.\.|Attention Required! \| Cloudflare)/i.test(body);
+  if (blocked) {
     throw new BlockedError(`Blocked by 8a.nu anti-scraping protection on ${url} (${response.status})`);
   }
   if (!response.ok) {
@@ -242,177 +158,134 @@ async function fetchHtml(url: string): Promise<string> {
   return body;
 }
 
-/** Only keep real news article pages, e.g. https://www.8a.nu/news/some-slug */
-function isNewsArticleUrl(url: string): boolean {
-  try {
-    const parsed = new URL(url);
-    return /(^|\.)8a\.nu$/.test(parsed.hostname) && /^\/news\/[^/]+\/?$/.test(parsed.pathname);
-  } catch {
-    return false;
-  }
-}
-
-async function collectArticleCandidatesFromPage(url: string): Promise<Array<Record<string, any>>> {
-  const html = await fetchHtml(url);
+/** Parses the /news listing. Each entry already carries title, date, image and content. */
+function parseNewsList(html: string): Array<Item & { hasContent: boolean }> {
   const { document } = parseHTML(html);
-
-  const candidates: Array<Record<string, any>> = [];
+  const items: Array<Item & { hasContent: boolean }> = [];
   const seen = new Set<string>();
 
-  for (const selector of LIST_SELECTORS) {
-    const container = document.querySelector(selector);
-    if (!container) continue;
+  for (const entry of Array.from(document.querySelectorAll('.news-list .news-item'))) {
+    const titleLink = entry.querySelector('h1 a, h2 a, h3 a, h4 a') ?? entry.querySelector('a[href*="/news/"]');
+    const url = toArticleUrl(titleLink?.getAttribute('href'));
+    const title = cleanText(entry.querySelector('h1, h2, h3, h4')?.textContent ?? titleLink?.textContent);
+    if (!url || !title || seen.has(url)) continue;
+    seen.add(url);
 
-    const items = container.querySelectorAll('a[href], article, .news-item, .article-item, .post-card, .article-card, .news-card');
-    for (const item of items) {
-      const anchor = item.closest('a[href]') ?? item.querySelector('a[href]');
-      const href = toAbsoluteUrl(anchor?.getAttribute('href') ?? item.getAttribute('data-href') ?? null);
-      if (!href) continue;
-      if (seen.has(href)) continue;
-      seen.add(href);
+    const newsContent = entry.querySelector('.news-content');
+    const videoSrc = toAbsoluteUrl(entry.querySelector('.video-container iframe, .news-content iframe')?.getAttribute('src'));
+    const image = firstImage(entry.querySelector('.news-image-container') ?? entry) ?? youtubeThumbnail(videoSrc);
+    const summary = summarize(newsContent?.innerHTML ?? '') || title; // before buildContent mutates it
+    const content = buildContent(newsContent, image, videoSrc, url);
 
-      const title = findFirstText(item, TITLE_SELECTORS) ?? cleanText(anchor?.textContent ?? null) ?? cleanText((item as Element).textContent ?? null);
-      const dateText = findFirstText(item, DATE_SELECTORS) ?? findFirstText(anchor ?? item, DATE_SELECTORS);
-      const description = extractDescription(item) ?? extractDescription(anchor ?? item);
-      const image = selectBestImage(item) ?? selectBestImage(anchor ?? item);
-
-      if (title) {
-        candidates.push({
-          url: href,
-          title,
-          date: dateText,
-          description,
-          image,
-        });
-      }
-    }
-  }
-
-  // Fallback: any link pointing at a news article page.
-  for (const anchor of document.querySelectorAll('a[href*="/news/"]')) {
-    const href = toAbsoluteUrl(anchor.getAttribute('href'));
-    if (!href || seen.has(href) || /\/news\/?$/.test(new URL(href).pathname)) continue;
-    const title = findFirstText(anchor, TITLE_SELECTORS) ?? cleanText(anchor.textContent ?? null);
-    if (!title) continue;
-    seen.add(href);
-    candidates.push({
-      url: href,
+    items.push({
+      url,
       title,
-      date: findFirstText(anchor, DATE_SELECTORS),
-      description: undefined,
-      image: selectBestImage(anchor),
+      content,
+      summary,
+      image,
+      published: parseDate(entry.querySelector('.news-item-topline')?.textContent) ?? new Date(),
+      hasContent: cleanText(newsContent?.textContent).length > 0 || !!newsContent?.querySelector('iframe, img'),
     });
   }
 
-  for (const article of extractJsonLdArticles(document)) {
-    const normalized = normalizeCandidate(article);
-    if (!normalized) continue;
-    if (seen.has(normalized.url)) continue;
-    seen.add(normalized.url);
-    candidates.push(normalized);
-  }
-
-  return candidates;
+  return items;
 }
 
-async function loadArticleDetails(url: string): Promise<{ title: string; description?: string; image?: string; published: Date }> {
-  const html = await fetchHtml(url);
-  const { document } = parseHTML(html);
+/** Fetches an article page, for new listing entries whose content was empty. */
+async function fetchArticle(listed: Item): Promise<Item> {
+  const { document } = parseHTML(await fetchHtml(listed.url));
+  const article = document.querySelector('.news-page-container .news-item');
+  if (!article) return listed;
 
-  const title =
-    findFirstText(document.querySelector('article'), TITLE_SELECTORS) ??
-    findFirstText(document.body, TITLE_SELECTORS) ??
-    document.querySelector('meta[property="og:title"]')?.getAttribute('content') ??
-    (document.title || 'Untitled article');
-
-  const dateText =
-    findFirstText(document.querySelector('article'), DATE_SELECTORS) ??
-    findFirstText(document.body, DATE_SELECTORS) ??
-    document.querySelector('meta[property="article:published_time"]')?.getAttribute('content') ??
-    document.querySelector('meta[name="pubdate"]')?.getAttribute('content') ??
-    null;
-
-  const articleContent =
-    document.querySelector('.news-content, .article-content, .entry-content, .post-content, main article, article') ??
-    document.body;
-
-  const description =
-    document.querySelector('meta[property="og:description"]')?.getAttribute('content') ??
-    extractDescription(articleContent) ??
-    undefined;
-
-  const image =
-    selectBestImage(document.querySelector('article')) ??
-    selectBestImage(document.body) ??
-    document.querySelector('meta[property="og:image"]')?.getAttribute('content') ??
-    undefined;
-
+  const newsContent = article.querySelector('.news-content');
+  const image = firstImage(article) ?? listed.image;
+  const summary = summarize(newsContent?.innerHTML ?? '') || listed.summary;
   return {
-    title: cleanText(title),
-    description: description ? cleanText(description) : undefined,
-    image: image ? toAbsoluteUrl(image) ?? undefined : undefined,
-    published: parseDate(dateText),
+    url: listed.url,
+    title: cleanText(article.querySelector('h1')?.textContent) || listed.title,
+    content: buildContent(newsContent, image, undefined, listed.url),
+    summary,
+    image,
+    published: parseDate(article.querySelector('.news-item-topline')?.textContent) ?? listed.published,
   };
 }
 
-type ListedItem = { url: string; title: string; description?: string; image?: string; published: Date };
+/** Items from the feed published by the previous run (JSON Feed 1.0). */
+async function loadPreviousItems(): Promise<Item[]> {
+  try {
+    const response = await fetch(`${PUBLISHED_FEED_URL}/feed.json`);
+    if (!response.ok) throw new Error(`${response.status} ${response.statusText}`);
+    const json = (await response.json()) as { items?: Array<Record<string, any>> };
 
-async function index8aNews(): Promise<void> {
-  const uniqueItems = new Map<string, ListedItem>();
-
-  for (const candidateUrl of CANDIDATE_URLS) {
-    try {
-      const items = await collectArticleCandidatesFromPage(candidateUrl);
-      for (const item of items) {
-        const url = item.url?.split('#')[0]; // e.g. drop "#comments" duplicates
-        if (!url || !item.title || !isNewsArticleUrl(url)) continue;
-        if (!uniqueItems.has(url)) {
-          uniqueItems.set(url, {
-            url,
-            title: cleanText(item.title),
-            description: item.description ? cleanText(item.description) : undefined,
-            image: item.image ? toAbsoluteUrl(item.image) ?? undefined : undefined,
-            published: parseDate(item.date ?? null),
-          });
-        }
-      }
-    } catch (error) {
-      if (error instanceof BlockedError) throw error; // No point hammering other pages.
-      console.warn(`Skipping ${candidateUrl}:`, error instanceof Error ? error.message : error);
+    const items: Item[] = [];
+    for (const raw of json.items ?? []) {
+      const url = toArticleUrl(raw.url ?? raw.id);
+      // Skip entries produced by older versions of this script (site logo instead of the
+      // article image): they get rebuilt from the listing if still present there.
+      if (!url || !raw.title || /\/images\/vl-logos\//.test(raw.image ?? '')) continue;
+      items.push({
+        url,
+        title: raw.title,
+        content: raw.content_html ?? raw.content_text ?? raw.title,
+        summary: raw.summary ?? raw.title,
+        image: raw.image,
+        published: new Date(raw.date_published ?? raw.date_modified ?? Date.now()),
+      });
     }
+    console.log(`Loaded ${items.length} items from the previously published feed.`);
+    return items;
+  } catch (error) {
+    console.warn('Could not load the previously published feed, starting fresh:', error instanceof Error ? error.message : error);
+    return [];
   }
+}
 
-  const articleList = Array.from(uniqueItems.values()).slice(0, MAX_ARTICLES);
-  if (articleList.length === 0) {
-    throw new Error('No news articles were found on 8a.nu using the current structure.');
-  }
+// ---------------------------------------------------------------------------
+// Output
 
-  let blocked = false;
-  for (const item of articleList) {
-    if (blocked) {
-      appendFeedItem(item.url, item.title, item.description, item.image, item.published);
-      continue;
-    }
-    try {
-      const details = await loadArticleDetails(item.url);
-      const title = details.title || item.title;
-      appendFeedItem(item.url, title, details.description ?? item.description, details.image ?? item.image, details.published);
-    } catch (error) {
-      // Once blocked, stop fetching article pages and use the listing data for the rest.
-      if (error instanceof BlockedError) blocked = true;
-      console.warn(`Failed to resolve article details for ${item.url}:`, error instanceof Error ? error.message : error);
-      appendFeedItem(item.url, item.title, item.description, item.image, item.published);
-    }
+async function writeFeed(items: Item[]): Promise<void> {
+  const feed = new Feed({
+    title: '8a.nu news',
+    description: '8a.nu climbing and vertical life news feed',
+    id: BASE_URL,
+    link: NEWS_URL,
+    language: 'en',
+    image: `${BASE_URL}/favicon.png`,
+    favicon: `${BASE_URL}/favicon.png`,
+    copyright: 'All rights reserved, Vertical Life',
+    updated: items[0]?.published ?? new Date(),
+    generator: "Ecstrema's 8a.nu news feed generator",
+    feedLinks: {
+      rss: `${PUBLISHED_FEED_URL}/rss.xml`,
+      json: `${PUBLISHED_FEED_URL}/feed.json`,
+      atom: `${PUBLISHED_FEED_URL}/atom.xml`,
+    },
+    author: {
+      name: 'ecstrema',
+      email: 'remimarche@gmail.com',
+      link: 'https://ecstrema.com',
+    },
+  });
+
+  for (const item of items) {
+    feed.addItem({
+      title: item.title,
+      id: item.url,
+      link: item.url,
+      description: item.summary,
+      content: item.content,
+      image: item.image,
+      date: item.published,
+      published: item.published,
+    });
   }
 
   await Bun.write(`${distDir}/rss.xml`, feed.rss2());
   await Bun.write(`${distDir}/feed.json`, feed.json1());
   await Bun.write(`${distDir}/atom.xml`, feed.atom1());
-
-  console.log(`Indexed ${feed.items.length} 8a.nu news items into the feed.`);
 }
 
-/** Re-publish the last deployed feed so subscribers keep what they had. */
+/** Re-publish the last deployed feed files untouched. */
 async function restorePublishedFeed(): Promise<boolean> {
   try {
     for (const file of FEED_FILES) {
@@ -427,20 +300,53 @@ async function restorePublishedFeed(): Promise<boolean> {
   }
 }
 
-const distDir = './dist';
+// ---------------------------------------------------------------------------
+// Main
+
+async function main(): Promise<void> {
+  const previous = await loadPreviousItems();
+  const known = new Map(previous.map((item) => [item.url, item]));
+
+  const listed = parseNewsList(await fetchHtml(NEWS_URL));
+  if (listed.length === 0) {
+    throw new Error('No news articles were found on 8a.nu using the current structure.');
+  }
+
+  const fresh = listed.filter((item) => !known.has(item.url));
+  console.log(`Found ${listed.length} articles on ${NEWS_URL}, ${fresh.length} new.`);
+
+  let fetches = 0;
+  for (const item of fresh) {
+    let resolved: Item = item;
+    if (!item.hasContent && fetches < MAX_ARTICLE_FETCHES) {
+      fetches++;
+      try {
+        resolved = await fetchArticle(item);
+      } catch (error) {
+        console.warn(`Using listing data for ${item.url}:`, error instanceof Error ? error.message : error);
+        if (error instanceof BlockedError) fetches = MAX_ARTICLE_FETCHES; // stop fetching
+      }
+    }
+    const { hasContent, ...clean } = resolved as Item & { hasContent?: boolean };
+    known.set(clean.url, clean);
+  }
+
+  const items = Array.from(known.values())
+    .sort((a, b) => b.published.getTime() - a.published.getTime())
+    .slice(0, MAX_ITEMS);
+
+  await writeFeed(items);
+  console.log(`Wrote ${items.length} items (${fresh.length} new, ${fetches} article pages fetched).`);
+}
+
 await Bun.write(`${distDir}/.keep`, '');
 
 try {
-  await index8aNews();
+  await main();
 } catch (error) {
   const reason = error instanceof Error ? error.message : String(error);
   const restored = await restorePublishedFeed();
-  if (!restored) {
-    // Nothing to fall back on: publish a valid, empty feed rather than nothing.
-    await Bun.write(`${distDir}/rss.xml`, feed.rss2());
-    await Bun.write(`${distDir}/feed.json`, feed.json1());
-    await Bun.write(`${distDir}/atom.xml`, feed.atom1());
-  }
+  if (!restored) await writeFeed([]); // Nothing to fall back on: publish a valid, empty feed.
   // GitHub Actions annotation, so the stale feed is visible without failing the build.
   console.log(`::warning title=8a.nu scrape failed::${reason} — ${restored ? 'kept the previously published feed' : 'published an empty feed'}.`);
 }
